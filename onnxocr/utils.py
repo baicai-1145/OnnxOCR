@@ -260,6 +260,13 @@ def infer_args():
     parser.add_argument("--precision", type=str, default="fp32")
     parser.add_argument("--gpu_mem", type=int, default=500)
     parser.add_argument("--gpu_id", type=int, default=0)
+    parser.add_argument(
+        "--trt_engine_dir",
+        type=str,
+        default=str(module_dir / "models/ppocrv5/trt"),
+    )
+    parser.add_argument("--trt_precision", type=str, default="fp16")
+    parser.add_argument("--trt_fallback_onnx", type=str2bool, default=True)
 
     # params for text detector
     parser.add_argument("--image_dir", type=str)

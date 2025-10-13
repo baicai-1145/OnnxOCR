@@ -6,6 +6,7 @@ from .predict_base import PredictBase
 
 class TextDetector(PredictBase):
     def __init__(self, args):
+        super().__init__(args)
         self.args = args
         self.det_algorithm = args.det_algorithm
         pre_process_list = [
@@ -43,9 +44,9 @@ class TextDetector(PredictBase):
         self.postprocess_op = DBPostProcess(**postprocess_params)
 
         # 初始化模型
-        self.det_onnx_session = self.get_onnx_session(args.det_model_dir, args.use_gpu)
-        self.det_input_name = self.get_input_name(self.det_onnx_session)
-        self.det_output_name = self.get_output_name(self.det_onnx_session)
+        self.det_session = self.get_session(args.det_model_dir, args.use_gpu, "det")
+        self.det_input_name = self.get_input_name(self.det_session)
+        self.det_output_name = self.get_output_name(self.det_session)
 
     def order_points_clockwise(self, pts):
         rect = np.zeros((4, 2), dtype="float32")
@@ -104,7 +105,7 @@ class TextDetector(PredictBase):
         img = img.copy()
 
         input_feed = self.get_input_feed(self.det_input_name, img)
-        outputs = self.det_onnx_session.run(self.det_output_name, input_feed=input_feed)
+        outputs = self.det_session.run(self.det_output_name, input_feed=input_feed)
 
         preds = {}
         preds["maps"] = outputs[0]
