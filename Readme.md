@@ -40,6 +40,46 @@ pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 - The Mobile model is already in `onnxocr/models/ppocrv5` and requires no download;  
 - The PP-OCRv5_Server-ONNX model is large and uploaded to [Baidu Netdisk](https://pan.baidu.com/s/1hpENH_SkLDdwXkmlsX0GUQ?pwd=wu8t) (extraction code: wu8t). After downloading, place the `det` and `rec` models in `./models/ppocrv5/` to replace the existing ones.  
 
+## ⚡ TensorRT Acceleration
+
+OnnxOCR now ships with native TensorRT support. The current deployment targets the PP-OCRv5 Server model and delivers significant throughput gains (internal tests reached ~80× speedup).
+
+1. **Install TensorRT runtime**  
+   - Ensure your GPU driver / CUDA runtime matches the TensorRT build (e.g. CUDA 12.9 + TensorRT 10.13).  
+   - Install the Python wheels provided with the official TensorRT bundle, for example:  
+      ```bash
+      uv pip install tensorrt-10.13.3.9-cp311-none-linux_x86_64.whl \
+                     tensorrt_dispatch-10.13.3.9-cp311-none-linux_x86_64.whl \
+                     tensorrt_lean-10.13.3.9-cp311-none-linux_x86_64.whl
+      ```  
+   - If the wheels were unpacked manually, expose the shared libraries before running:  
+      ```bash
+      export LD_LIBRARY_PATH=/path/to/TensorRT/lib:$LD_LIBRARY_PATH
+      ```
+
+2. **Build TensorRT engines**  
+   Use the helper script to generate detection / recognition / classifier engines with enlarged dynamic shapes (recommended when using the PP-OCRv5 Server model):  
+   ```bash
+   python scripts/build_trt_engine.py \
+       --models det rec cls \
+       --precision fp32 \
+       --det-max-side 1280 \
+       --rec-max-width 1280 \
+       --cls-batch 6 \
+       --workspace $((1<<31)) \
+       --force
+   ```
+
+3. **Run FP32 inference (recommended)**  
+   ```bash
+   python test_ocr.py \
+       --use-gpu --use-tensorrt \
+       --trt-precision fp32 \
+       --trt-engine-dir onnxocr/models/ppocrv5/trt \
+       --warmup 3 --repeat 10
+   ```
+   > ⚠️ FP16 inference (`--trt-precision fp16`) is available, but we observed noticeable accuracy drops with PP-OCRv5 Server. Stick to FP32 for production unless you have validated FP16 precision on your dataset.
+
 
 ## 🚀 One-Click Run  
 ```bash  
