@@ -38,6 +38,46 @@ pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 - Mobile 模型已存在于 `onnxocr/models/ppocrv5` 下，无需下载；  
 - PP-OCRv5_Server-ONNX 模型过大，已上传至 [百度网盘](https://pan.baidu.com/s/1hpENH_SkLDdwXkmlsX0GUQ?pwd=wu8t)（提取码: wu8t），下载后将 `det` 和 `rec` 模型放到 `./models/ppocrv5/` 下替换即可。  
 
+## ⚡ TensorRT 加速
+
+当前 OnnxOCR 已内建 TensorRT 推理链路，针对 PP-OCRv5 Server 模型可获得显著速度提升（内部测试约 80×）。
+
+1. **安装 TensorRT 运行时**  
+   - 确保 GPU 驱动和 CUDA 版本与 TensorRT 匹配（示例：CUDA 12.9 + TensorRT 10.13）。  
+   - 安装官方提供的 Python wheel，例如：  
+     ```bash
+     uv pip install tensorrt-10.13.3.9-cp311-none-linux_x86_64.whl \
+                    tensorrt_dispatch-10.13.3.9-cp311-none-linux_x86_64.whl \
+                    tensorrt_lean-10.13.3.9-cp311-none-linux_x86_64.whl
+     ```  
+   - 如手工解压了 TensorRT 安装包，运行前需要：  
+     ```bash
+     export LD_LIBRARY_PATH=/path/to/TensorRT/lib:$LD_LIBRARY_PATH
+     ```
+
+2. **构建 TensorRT 引擎**  
+   使用项目脚本生成检测 / 识别 / 方向分类引擎，并放宽动态 shape（Server 模型建议扩大识别宽度）：  
+   ```bash
+   python scripts/build_trt_engine.py \
+       --models det rec cls \
+       --precision fp32 \
+       --det-max-side 1280 \
+       --rec-max-width 1280 \
+       --cls-batch 6 \
+       --workspace $((1<<31)) \
+       --force
+   ```
+
+3. **执行 FP32 推理（推荐）**  
+   ```bash
+   python test_ocr.py \
+       --use-gpu --use-tensorrt \
+       --trt-precision fp32 \
+       --trt-engine-dir onnxocr/models/ppocrv5/trt \
+       --warmup 3 --repeat 10
+   ```
+   > ⚠️ 支持 `--trt-precision fp16`，但我们在 PP-OCRv5 Server 模型上观察到一定精度损失。如需线上使用请先评估。
+
 
 ## 🚀 一键运行  
 ```bash  

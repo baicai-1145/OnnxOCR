@@ -12,7 +12,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image",
         type=Path,
-        default=Path("onnxocr/test_images/715873facf064583b44ef28295126fa7.jpg"),
+        default=Path("onnxocr/test_images/images/999.jpg"),
         help="测试图片路径",
     )
     parser.add_argument(

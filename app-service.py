@@ -1,15 +1,60 @@
+import os
 import cv2
 import time
 import base64
 import numpy as np
-from flask import Flask, request, jsonify,render_template
+from pathlib import Path
+from flask import Flask, request, jsonify, render_template
 from onnxocr.onnx_paddleocr import ONNXPaddleOcr
+from onnxocr.utils import str2bool
 
 # 初始化 Flask 应用
 app = Flask(__name__)
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return str2bool(value)
+    except Exception:
+        return default
+
+
+def _build_model_kwargs() -> dict:
+    base_dir = Path(__file__).resolve().parent
+    default_engine_dir = base_dir / "onnxocr" / "models" / "ppocrv5" / "trt"
+
+    use_angle_cls = _env_bool("OCR_USE_ANGLE_CLS", True)
+    use_gpu = _env_bool("OCR_USE_GPU", False)
+    use_tensorrt = _env_bool("OCR_USE_TRT", False)
+    trt_precision = os.getenv("OCR_TRT_PRECISION", "fp32")
+    trt_engine_dir = os.getenv("OCR_TRT_ENGINE_DIR", str(default_engine_dir))
+    trt_fallback = _env_bool("OCR_TRT_FALLBACK_ONNX", False)
+
+    kwargs = {
+        "use_angle_cls": use_angle_cls,
+        "use_gpu": use_gpu,
+    }
+    if use_tensorrt and use_gpu:
+        kwargs.update(
+            {
+                "use_tensorrt": True,
+                "trt_precision": trt_precision,
+                "trt_engine_dir": trt_engine_dir,
+                "trt_fallback_onnx": trt_fallback,
+            }
+        )
+    elif use_tensorrt and not use_gpu:
+        print("[OnnxOCR] WARNING: OCR_USE_TRT enabled but OCR_USE_GPU=false; TensorRT will be disabled.")
+
+    print("[OnnxOCR] Model initialized with:", kwargs)
+    return kwargs
+
+
 # 初始化 OCR 模型
-model = ONNXPaddleOcr(use_angle_cls=True, use_gpu=False)
+model = ONNXPaddleOcr(**_build_model_kwargs())
 
 @app.route('/')
 def index():

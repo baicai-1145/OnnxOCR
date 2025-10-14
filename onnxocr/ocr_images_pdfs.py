@@ -5,7 +5,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from onnxocr.onnx_paddleocr import ONNXPaddleOcr, sav2Img
 import cv2
-from typing import List, Callable
+from typing import List, Callable, Optional, Dict, Any
 from pathlib import Path
 import time
 import numpy as np
@@ -40,13 +40,16 @@ class OCRLogic:
     """
     OCR 业务逻辑主类，支持批量图片/PDF识别，多线程加速，模型热切换等
     """
-    def __init__(self, status_callback: Callable[[str], None]):
+    def __init__(self, status_callback: Callable[[str], None], model_kwargs: Optional[Dict[str, Any]] = None):
         """
         初始化，传入状态回调函数用于UI进度提示
         """
         self.status_callback = status_callback
-        # 默认初始化OCR模型
-        self.model = ONNXPaddleOcr(use_angle_cls=True, use_gpu=False)
+        self._base_model_kwargs = model_kwargs.copy() if model_kwargs else {}
+        default_kwargs = {"use_angle_cls": True, "use_gpu": False}
+        default_kwargs.update(self._base_model_kwargs)
+        self.model = ONNXPaddleOcr(**default_kwargs)
+        self._current_model_kwargs = default_kwargs
 
     def run(self, files: List[str], save_txt: bool, merge_txt: bool, output_img: bool = False, file_time_callback=None, pdf_progress_callback=None, max_workers: int = 4):
         """
@@ -209,7 +212,7 @@ class OCRLogic:
         os.makedirs(out_dir, exist_ok=True)
         return out_dir
 
-    def set_model(self, model_name, use_gpu=False):
+    def set_model(self, model_name, use_gpu=None):
         """
         切换OCR模型，支持多模型热切换，所有模型统一用ppocrv5字典
         use_gpu: 是否启用GPU
@@ -228,32 +231,54 @@ class OCRLogic:
         cls_model_dir = os.path.join(model_path, "cls", "cls.onnx")
         rec_char_dict_path = os.path.join(base_model_dir, "ppocrv5", "ppocrv5_dict.txt")
         rec_model_dir = os.path.join(model_path, "rec", "rec.onnx") if os.path.exists(os.path.join(model_path, "rec", "rec.onnx")) else None
-        ocr_kwargs = dict(
-            use_angle_cls=True,
-            use_gpu=use_gpu,  # 关键：传递GPU参数
-            det_model_dir=det_model_dir,
-            cls_model_dir=cls_model_dir,
-            rec_char_dict_path=rec_char_dict_path
+        base_kwargs = self._base_model_kwargs.copy()
+        if use_gpu is None:
+            use_gpu = base_kwargs.get("use_gpu", False)
+        ocr_kwargs = dict(base_kwargs)
+        ocr_kwargs.update(
+            dict(
+                use_angle_cls=ocr_kwargs.get("use_angle_cls", True),
+                use_gpu=use_gpu,
+                det_model_dir=det_model_dir,
+                cls_model_dir=cls_model_dir,
+                rec_char_dict_path=rec_char_dict_path,
+            )
         )
         if rec_model_dir and os.path.exists(rec_model_dir):
             ocr_kwargs["rec_model_dir"] = rec_model_dir
+        if not ocr_kwargs.get("use_gpu") and ocr_kwargs.get("use_tensorrt"):
+            # TensorRT 依赖 GPU，若当前配置禁用 GPU，自动关闭 TRT
+            ocr_kwargs.pop("use_tensorrt", None)
+            ocr_kwargs.pop("trt_precision", None)
+            ocr_kwargs.pop("trt_engine_dir", None)
+            ocr_kwargs.pop("trt_fallback_onnx", None)
+        if self._current_model_kwargs and all(
+            ocr_kwargs.get(k) == self._current_model_kwargs.get(k)
+            for k in set(ocr_kwargs.keys()).union(self._current_model_kwargs.keys())
+        ):
+            return
+
         try:
             self.model = ONNXPaddleOcr(**ocr_kwargs)
+            self._current_model_kwargs = ocr_kwargs
             if use_gpu:
                 try:
-                    import onnxruntime as ort
-                    providers = self.model.session.get_providers() if hasattr(self.model, 'session') else []
-                    if not any('CUDA' in p for p in providers):
-                        msg = ("未检测到可用GPU，已自动切换为CPU推理。请检查CUDA/cuDNN环境配置。")
-                        if hasattr(self, 'ui_ref') and hasattr(self.ui_ref, 'update_gpu_status'):
-                            self.ui_ref.update_gpu_status(msg)
-                        if hasattr(self, 'status_callback'):
-                            self.status_callback("[警告] 未检测到可用GPU，已切换为CPU推理。请检查CUDA/cuDNN环境配置。")
+                    if hasattr(self.model, "session"):
+                        providers = self.model.session.get_providers()
+                        if not any("CUDA" in p for p in providers):
+                            msg = "未检测到可用GPU，已自动切换为CPU推理。请检查CUDA/cuDNN环境配置。"
+                            if hasattr(self, "ui_ref") and hasattr(self.ui_ref, "update_gpu_status"):
+                                self.ui_ref.update_gpu_status(msg)
+                            if hasattr(self, "status_callback"):
+                                self.status_callback("[警告] 未检测到可用GPU，已切换为CPU推理。请检查CUDA/cuDNN环境配置。")
+                    elif self._current_model_kwargs.get("use_tensorrt"):
+                        # TensorRT 模式下无法通过 onnxruntime 获取 provider，此处默认视为成功
+                        pass
                 except Exception:
-                    msg = ("检测GPU状态时发生异常，可能未正确安装CUDA/cuDNN或onnxruntime-gpu。已自动切换为CPU推理。")
-                    if hasattr(self, 'ui_ref') and hasattr(self.ui_ref, 'update_gpu_status'):
+                    msg = "检测GPU状态时发生异常，可能未正确安装CUDA/cuDNN或onnxruntime-gpu。已自动切换为CPU推理。"
+                    if hasattr(self, "ui_ref") and hasattr(self.ui_ref, "update_gpu_status"):
                         self.ui_ref.update_gpu_status(msg)
-                    if hasattr(self, 'status_callback'):
+                    if hasattr(self, "status_callback"):
                         self.status_callback("[警告] GPU检测异常，已切换为CPU推理。请检查CUDA/cuDNN环境配置。")
         except Exception as e:
             if use_gpu:
@@ -263,6 +288,15 @@ class OCRLogic:
                 if hasattr(self, 'status_callback'):
                     self.status_callback("[警告] GPU初始化失败，已切换为CPU推理。请检查CUDA/cuDNN环境配置。")
                 ocr_kwargs["use_gpu"] = False
+                if ocr_kwargs.get("use_tensorrt"):
+                    ocr_kwargs.pop("use_tensorrt", None)
+                    ocr_kwargs.pop("trt_precision", None)
+                    ocr_kwargs.pop("trt_engine_dir", None)
+                    ocr_kwargs.pop("trt_fallback_onnx", None)
                 self.model = ONNXPaddleOcr(**ocr_kwargs)
+                self._current_model_kwargs = ocr_kwargs
             else:
                 raise
+
+    def set_status_callback(self, callback: Callable[[str], None]):
+        self.status_callback = callback

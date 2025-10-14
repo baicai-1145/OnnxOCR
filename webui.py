@@ -1,6 +1,7 @@
 import os
 import time
 import zipfile
+from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for
 from werkzeug.utils import secure_filename
 from onnxocr.ocr_images_pdfs import OCRLogic
@@ -8,6 +9,7 @@ import cv2
 import base64
 import numpy as np
 from onnxocr.onnx_paddleocr import ONNXPaddleOcr
+from onnxocr.utils import str2bool
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_ROOT = os.path.join(BASE_DIR, "uploads")
@@ -20,9 +22,51 @@ MODEL_OPTIONS = ["PP-OCRv5", "PP-OCRv4", "ch_ppocr_server_v2.0"]
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB
 
-ocr_logic = OCRLogic(lambda msg: print(msg))
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return str2bool(value)
+    except Exception:
+        return default
+
+
+def _build_model_kwargs() -> dict:
+    default_engine_dir = Path(BASE_DIR) / "onnxocr" / "models" / "ppocrv5" / "trt"
+
+    use_angle_cls = _env_bool("OCR_USE_ANGLE_CLS", True)
+    use_gpu = _env_bool("OCR_USE_GPU", False)
+    use_tensorrt = _env_bool("OCR_USE_TRT", False)
+    trt_precision = os.getenv("OCR_TRT_PRECISION", "fp32")
+    trt_engine_dir = os.getenv("OCR_TRT_ENGINE_DIR", str(default_engine_dir))
+    trt_fallback = _env_bool("OCR_TRT_FALLBACK_ONNX", False)
+
+    kwargs = {
+        "use_angle_cls": use_angle_cls,
+        "use_gpu": use_gpu,
+    }
+    if use_tensorrt and use_gpu:
+        kwargs.update(
+            {
+                "use_tensorrt": True,
+                "trt_precision": trt_precision,
+                "trt_engine_dir": trt_engine_dir,
+                "trt_fallback_onnx": trt_fallback,
+            }
+        )
+    elif use_tensorrt and not use_gpu:
+        print("[OnnxOCR][WebUI] WARNING: OCR_USE_TRT enabled but OCR_USE_GPU=false; TensorRT will be disabled.")
+
+    print("[OnnxOCR][WebUI] Model init kwargs:", kwargs)
+    return kwargs
+
+
+MODEL_KWARGS = _build_model_kwargs()
+
+ocr_logic = OCRLogic(lambda msg: print(msg), model_kwargs=MODEL_KWARGS)
 # 独立 OCR 模型实例，避免影响 ocr_logic
-ocr_model_api = ONNXPaddleOcr(use_angle_cls=True, use_gpu=False)
+ocr_model_api = ONNXPaddleOcr(**MODEL_KWARGS)
 
 @app.route("/")
 def index():
@@ -64,10 +108,11 @@ def ocr_files():
         file.save(file_path)
         file_paths.append(file_path)
     results = []
-    def status_callback(msg): pass
-    logic = OCRLogic(status_callback)
-    logic.set_model(model_name)
-    logic.run(file_paths, save_txt=True, merge_txt=False, output_img=False)
+    def status_callback(msg):
+        pass
+    ocr_logic.set_status_callback(status_callback)
+    ocr_logic.set_model(model_name)
+    ocr_logic.run(file_paths, save_txt=True, merge_txt=False, output_img=False)
     txt_files = []
     for file_path in file_paths:
         out_dir = os.path.join(os.path.dirname(file_path), "Output_OCR")
@@ -132,4 +177,4 @@ def ocr_api():
     })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5005, debug=True)
+    app.run(host="0.0.0.0", port=5005, debug=False)
