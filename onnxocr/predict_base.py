@@ -28,6 +28,7 @@ class PredictBase(object):
             raise RuntimeError("TensorRT session requires runtime args")
 
         from . import trt_utils
+        import re
 
         engine_dir = getattr(self.args, "trt_engine_dir", None)
         precision = getattr(self.args, "trt_precision", "fp16")
@@ -50,6 +51,25 @@ class PredictBase(object):
             raise
 
         self.logger.info("Loaded TensorRT engine: %s", engine_path)
+        # 如果是多profile且为 rec/cls，则创建范围型多profile会话；否则默认单会话
+        if model_key in ("rec", "cls") and engine.num_optimization_profiles > 1:
+            def _parse_ranges(text: str) -> list[tuple[int, int]]:
+                arr = []
+                for seg in re.split(r"[ ,]+", text or ""):
+                    if not seg:
+                        continue
+                    lo, hi = seg.split(":")
+                    arr.append((int(lo), int(hi)))
+                return arr
+
+            if model_key == "rec":
+                ranges = _parse_ranges(getattr(self.args, "rec_ranges", "32:144,144:480,480:1280"))
+                max_b = int(getattr(self.args, "rec_batch_num", 6))
+            else:
+                ranges = _parse_ranges(getattr(self.args, "cls_ranges", "24:80,80:144,144:192"))
+                max_b = int(getattr(self.args, "cls_batch_num", 6))
+            profile_specs = [(lo, hi, max_b) for (lo, hi) in ranges]
+            return trt_utils.TensorRTMultiProfileSession(engine, profile_specs=profile_specs)
         return trt_utils.TensorRTSession(engine)
 
     def get_session(self, model_path: str, use_gpu: bool, model_key: str):

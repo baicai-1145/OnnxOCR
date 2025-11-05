@@ -16,5 +16,8 @@ pdf2image
 onnx>=1.14.0
 pycuda
 
+# NVIDIA CUDA runtime Python bindings (required by TensorRT code path)
+cuda-python<13.0.0
+
 # TensorRT support (install matching NVIDIA wheel manually if needed)
 # tensorrt

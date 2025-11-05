@@ -267,6 +267,19 @@ def infer_args():
     )
     parser.add_argument("--trt_precision", type=str, default="fp16")
     parser.add_argument("--trt_fallback_onnx", type=str2bool, default=True)
+    # Multi-range dynamic profiles for rec/cls (FP32 优化用)
+    parser.add_argument(
+        "--rec_ranges",
+        type=str,
+        default="32:144,144:480,480:2048",
+        help="rec 动态宽度区间，逗号分隔，格式 low:high（h=48）",
+    )
+    parser.add_argument(
+        "--cls_ranges",
+        type=str,
+        default="24:80,80:144,144:192",
+        help="cls 动态宽度区间，逗号分隔，格式 low:high（h=48）",
+    )
 
     # params for text detector
     parser.add_argument("--image_dir", type=str)

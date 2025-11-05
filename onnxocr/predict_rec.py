@@ -14,6 +14,21 @@ class TextRecognizer(PredictBase):
         self.rec_image_shape = [int(v) for v in args.rec_image_shape.split(",")]
         self.rec_batch_num = args.rec_batch_num
         self.rec_algorithm = args.rec_algorithm
+        # 解析动态宽度区间（用于分段分桶批处理）
+        try:
+            ranges_text = getattr(args, "rec_ranges", "32:144,144:480,480:1280")
+            rec_ranges = []
+            for seg in ranges_text.replace(" ", "").split(","):
+                if not seg:
+                    continue
+                lo, hi = seg.split(":")
+                lo_i, hi_i = int(lo), int(hi)
+                if lo_i >= hi_i:
+                    continue
+                rec_ranges.append((lo_i, hi_i))
+            self._rec_ranges = rec_ranges if rec_ranges else [(32, 144), (144, 480), (480, 1280)]
+        except Exception:
+            self._rec_ranges = [(32, 144), (144, 480), (480, 1280)]
         self.postprocess_op = CTCLabelDecode(
             character_dict_path=args.rec_char_dict_path,
             use_space_char=args.use_space_char,
@@ -54,6 +69,14 @@ class TextRecognizer(PredictBase):
 
         assert imgC == img.shape[2]
         imgW = int((imgH * max_wh_ratio))
+        # clamp imgW to last range upper bound to satisfy dynamic profile
+        try:
+            if hasattr(self, "_rec_ranges") and self._rec_ranges:
+                max_allowed = int(self._rec_ranges[-1][1])
+                if imgW > max_allowed:
+                    imgW = max_allowed
+        except Exception:
+            pass
 
         # w = self.rec_onnx_session.get_inputs()[0].shape[3:][0]
         # w = self.rec_onnx_session.get_inputs()[0].shape[3:][0]
@@ -280,48 +303,65 @@ class TextRecognizer(PredictBase):
 
     def __call__(self, img_list):
         img_num = len(img_list)
-        # Calculate the aspect ratio of all text bars
-        width_list = []
+        imgC, imgH, imgW = self.rec_image_shape[:3]
+        # 计算每个裁剪在 h=48 下的目标宽（用于分段）
+        widths_48 = []
         for img in img_list:
-            width_list.append(img.shape[1] / float(img.shape[0]))
-        # Sorting can speed up the recognition process
-        indices = np.argsort(np.array(width_list))
+            h, w = img.shape[0:2]
+            ratio = w / float(h)
+            widths_48.append(int(np.ceil(imgH * ratio)))
+
+        # 分段分桶
+        bins: list[list[int]] = [[] for _ in range(len(self._rec_ranges))]
+        for i, w48 in enumerate(widths_48):
+            placed = False
+            for b_idx, (lo, hi) in enumerate(self._rec_ranges):
+                if w48 >= lo and w48 <= hi:
+                    bins[b_idx].append(i)
+                    placed = True
+                    break
+            if not placed:
+                bins[-1].append(i)
+
+        # 处理顺序：常见段（默认第二段）->短->长（3段时）
+        order = list(range(len(self._rec_ranges)))
+        if len(order) == 3:
+            order = [1, 0, 2]
+
         rec_res = [["", 0.0]] * img_num
         batch_num = self.rec_batch_num
 
-        for beg_img_no in range(0, img_num, batch_num):
-            end_img_no = min(img_num, beg_img_no + batch_num)
-            norm_img_batch = []
-            imgC, imgH, imgW = self.rec_image_shape[:3]
-            max_wh_ratio = imgW / imgH
-            # max_wh_ratio = 0
-            for ino in range(beg_img_no, end_img_no):
-                h, w = img_list[indices[ino]].shape[0:2]
-                wh_ratio = w * 1.0 / h
-                max_wh_ratio = max(max_wh_ratio, wh_ratio)
-            for ino in range(beg_img_no, end_img_no):
-                norm_img = self.resize_norm_img(img_list[indices[ino]], max_wh_ratio)
-                norm_img = norm_img[np.newaxis, :]
-                norm_img_batch.append(norm_img)
+        for b_idx in order:
+            idxs = bins[b_idx]
+            if not idxs:
+                continue
+            # 段内按宽排序
+            idxs = sorted(idxs, key=lambda i: widths_48[i])
+            for beg in range(0, len(idxs), batch_num):
+                end = min(len(idxs), beg + batch_num)
+                sel = idxs[beg:end]
+                # 批最大宽比
+                max_wh_ratio = 0.0
+                for i in sel:
+                    h, w = img_list[i].shape[0:2]
+                    wh_ratio = w * 1.0 / h
+                    if wh_ratio > max_wh_ratio:
+                        max_wh_ratio = wh_ratio
+                # 组装批
+                norm_img_batch = []
+                for i in sel:
+                    norm_img = self.resize_norm_img(img_list[i], max_wh_ratio)
+                    norm_img = norm_img[np.newaxis, :]
+                    norm_img_batch.append(norm_img)
+                norm_img_batch = np.concatenate(norm_img_batch).copy()
 
-            norm_img_batch = np.concatenate(norm_img_batch)
-            norm_img_batch = norm_img_batch.copy()
-
-            # img = img[:, :, ::-1].transpose(2, 0, 1)
-            # img = img[:, :, ::-1]
-            # img = img.transpose(2, 0, 1)
-            # img = img.astype(np.float32)
-            # img = np.expand_dims(img, axis=0)
-            # print(img.shape)
-            input_feed = self.get_input_feed(self.rec_input_name, norm_img_batch)
-            outputs = self.rec_session.run(
-                self.rec_output_name, input_feed=input_feed
-            )
-
-            preds = outputs[0]
-
-            rec_result = self.postprocess_op(preds)
-            for rno in range(len(rec_result)):
-                rec_res[indices[beg_img_no + rno]] = rec_result[rno]
+                input_feed = self.get_input_feed(self.rec_input_name, norm_img_batch)
+                outputs = self.rec_session.run(
+                    self.rec_output_name, input_feed=input_feed
+                )
+                preds = outputs[0]
+                rec_result = self.postprocess_op(preds)
+                for k, i in enumerate(sel):
+                    rec_res[i] = rec_result[k]
 
         return rec_res

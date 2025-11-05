@@ -40,6 +40,12 @@ pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
 ## ⚡ TensorRT 加速
 
+使用建议
+- 推荐使用“动态 shape 的 TensorRT”。在我们的测试环境下：
+  - 在 RTX 4090 上，相比 ONNX GPU 约 85× 加速；
+  - 相比 Ryzen 5 9600X（ONNX CPU）约 15× 加速；
+  - 实际效果因数据、驱动与 TensorRT 版本有所差异；为保证精度一致，建议使用 FP32。
+
 当前 OnnxOCR 已内建 TensorRT 推理链路，针对 PP-OCRv5 Server 模型可获得显著速度提升（内部测试约 80×）。
 
 1. **安装 TensorRT 运行时**  

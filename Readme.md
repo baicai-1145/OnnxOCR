@@ -42,7 +42,13 @@ pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
 ## ⚡ TensorRT Acceleration
 
-OnnxOCR now ships with native TensorRT support. The current deployment targets the PP-OCRv5 Server model and delivers significant throughput gains (internal tests reached ~80× speedup).
+OnnxOCR now ships with native TensorRT support. The current deployment targets the PP-OCRv5 Server model and delivers significant throughput gains.
+
+Recommendation
+- Prefer dynamic-shape TensorRT for production. In our measurements on common setups:
+  - RTX 4090: ~85× vs ONNX GPU.
+  - ONNX CPU on Ryzen 5 9600X: ~15×.
+  - Results vary with data, drivers and TensorRT version; use FP32 for accuracy parity.
 
 1. **Install TensorRT runtime**  
    - Ensure your GPU driver / CUDA runtime matches the TensorRT build (e.g. CUDA 12.9 + TensorRT 10.13).  

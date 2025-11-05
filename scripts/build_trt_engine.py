@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rec-max-width",
         type=int,
-        default=640,
+        default=2048,
         help="识别模型最大宽度",
     )
     parser.add_argument(

@@ -165,6 +165,85 @@ def build_engine(
     return engine_path
 
 
+def build_engine_multi_profiles(
+    onnx_path: Path,
+    engine_path: Path,
+    profiles_list: List[ProfileDict],
+    *,
+    precision: str = "fp16",
+    workspace_size: int = 1 << 30,
+    sparse_weights: bool = False,
+    force_rebuild: bool = False,
+) -> Path:
+    """
+    从 ONNX 构建“单引擎多优化 Profile”的 TensorRT 引擎。
+    每个 Profile 可为动态范围（min/opt/max 均可不同）。
+    """
+    onnx_path = onnx_path.resolve()
+    engine_path = engine_path.resolve()
+
+    if not onnx_path.exists():
+        raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
+
+    if (
+        not force_rebuild
+        and engine_path.exists()
+        and engine_path.stat().st_mtime >= onnx_path.stat().st_mtime
+    ):
+        logger.info("Skip rebuild, engine is up-to-date: %s", engine_path)
+        return engine_path
+
+    builder = trt.Builder(TRT_LOGGER)
+    network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    network = builder.create_network(flags=network_flags)
+    _parse_onnx(network, onnx_path)
+
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
+
+    if precision.lower() == "fp16":
+        if builder.platform_has_fast_fp16:
+            config.set_flag(trt.BuilderFlag.FP16)
+        else:
+            logger.warning("FP16 not supported on this platform, fallback to FP32")
+    elif precision.lower() == "fp32":
+        pass
+    else:
+        raise ValueError("Only fp16/fp32 precision is currently supported")
+
+    if sparse_weights:
+        if builder.platform_has_fast_sparse:
+            config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
+        else:
+            logger.warning("Sparse weights not supported, skip")
+
+    if not profiles_list:
+        raise ValueError("profiles_list is empty")
+
+    for idx, profiles in enumerate(profiles_list):
+        profile = builder.create_optimization_profile()
+        for i in range(network.num_inputs):
+            inp = network.get_input(i)
+            if inp.name not in profiles:
+                raise KeyError(f"Missing profile for input {inp.name} (profile #{idx})")
+            shape = profiles[inp.name]
+            profile.set_shape(inp.name, shape.min, shape.opt, shape.max)
+        config.add_optimization_profile(profile)
+
+    engine_bytes = builder.build_serialized_network(network, config)
+    if engine_bytes is None:
+        raise RuntimeError(f"Failed to build TensorRT engine from {onnx_path}")
+
+    engine_path.parent.mkdir(parents=True, exist_ok=True)
+    with engine_path.open("wb") as f:
+        f.write(engine_bytes)
+    logger.info(
+        "TensorRT multi-profile engine saved to %s (profiles=%d)",
+        engine_path,
+        len(profiles_list),
+    )
+    return engine_path
+
 def load_engine(engine_path: Path) -> trt.ICudaEngine:
     """反序列化 TensorRT 引擎。"""
 
@@ -326,6 +405,177 @@ class TensorRTSession:
         return [host_array for _, host_array, _ in outputs_info]
 
 
+class TensorRTMultiProfileSession:
+    """
+    多优化 Profile 的 TensorRT 会话封装（范围型profile）。
+    - 为每个 profile 预创建独立的 ExecutionContext 与 Stream
+    - 依据输入形状（NCHW）的 N、W 选择合适的 profile
+    """
+
+    class _BindingInfo:
+        def __init__(self, name: str):
+            self.name = name
+
+    def __init__(
+        self,
+        engine: trt.ICudaEngine,
+        *,
+        device_id: int = 0,
+        # 每个profile的 (min_w, max_w, max_batch)
+        profile_specs: List[Tuple[int, int, int]],
+    ):
+        self.engine = engine
+        self.device_id = device_id
+        self.profile_specs = profile_specs
+
+        _cuda_check(cudart.cudaSetDevice(device_id), "cudaSetDevice")
+
+        if engine.num_optimization_profiles <= 0:
+            raise RuntimeError("Engine has no optimization profiles")
+
+        if len(profile_specs) != engine.num_optimization_profiles:
+            logger.warning(
+                "[TRT] profile_specs length (%d) != engine profiles (%d)",
+                len(profile_specs),
+                engine.num_optimization_profiles,
+            )
+
+        self.contexts: List[trt.IExecutionContext] = []
+        self.streams: List[int] = []
+        for idx in range(engine.num_optimization_profiles):
+            ctx = engine.create_execution_context()
+            if ctx is None:
+                raise RuntimeError("Failed to create execution context")
+            status, stream = cudart.cudaStreamCreate()
+            _cuda_check(status, "cudaStreamCreate")
+            ctx.set_optimization_profile_async(idx, stream)
+            self.contexts.append(ctx)
+            self.streams.append(stream)
+
+        tensor_names = [engine.get_tensor_name(i) for i in range(engine.num_io_tensors)]
+        self._input_names = [
+            self._BindingInfo(name)
+            for name in tensor_names
+            if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+        ]
+        self._output_names = [
+            self._BindingInfo(name)
+            for name in tensor_names
+            if engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT
+        ]
+
+    def __del__(self):
+        try:
+            for stream in getattr(self, "streams", []) or []:
+                cudart.cudaStreamDestroy(stream)
+        except Exception:
+            pass
+
+    # 与 onnxruntime.InferenceSession 接口保持一致
+    def get_inputs(self) -> List["TensorRTMultiProfileSession._BindingInfo"]:
+        return self._input_names
+
+    def get_outputs(self) -> List["TensorRTMultiProfileSession._BindingInfo"]:
+        return self._output_names
+
+    def _select_profile_index(self, n: int, w: int) -> int:
+        # 优先选择包含 (n,w) 的profile；若多匹配，取 max_w 最接近 w 的
+        candidates: List[Tuple[int, Tuple[int, int, int]]] = []
+        for idx, spec in enumerate(self.profile_specs):
+            min_w, max_w, max_b = spec
+            if n <= max_b and w >= min_w and w <= max_w:
+                candidates.append((idx, spec))
+        if candidates:
+            # 选 max_w 距离 w 最小的
+            best_idx = min(candidates, key=lambda t: abs(t[1][1] - w))[0]
+            return best_idx
+        # fallback：选第一个 max_w >= w 的，否则最后一个
+        for idx, spec in enumerate(self.profile_specs):
+            if w <= spec[1]:
+                return idx
+        return len(self.profile_specs) - 1
+
+    def run(self, output_names: List[str], input_feed: Dict[str, np.ndarray]):
+        if not output_names:
+            output_names = [info.name for info in self._output_names]
+        if not input_feed:
+            raise ValueError("Empty input_feed")
+
+        first_name = next(iter(input_feed.keys()))
+        first_array = np.asarray(input_feed[first_name])
+        if first_array.ndim != 4:
+            raise ValueError("Expect NCHW input")
+        n, _, _, w = first_array.shape
+
+        prof_idx = self._select_profile_index(int(n), int(w))
+        context = self.contexts[prof_idx]
+        stream = self.streams[prof_idx]
+
+        # 设置输入
+        staged_inputs: List[Tuple[str, np.ndarray]] = []
+        for name, array in input_feed.items():
+            if self.engine.get_tensor_mode(name) != trt.TensorIOMode.INPUT:
+                raise KeyError(f"Tensor {name} is not registered as input")
+            expected_dtype = np.dtype(trt.nptype(self.engine.get_tensor_dtype(name)))
+            host_array = np.asarray(array, dtype=expected_dtype)
+            host_array = np.ascontiguousarray(host_array)
+            context.set_input_shape(name, host_array.shape)
+            staged_inputs.append((name, host_array))
+
+        input_allocations: List[int] = []
+        for name, host_array in staged_inputs:
+            bytes_size = host_array.nbytes
+            status, device_ptr = cudart.cudaMalloc(bytes_size)
+            _cuda_check(status, f"cudaMalloc input {name}")
+            _cuda_check(
+                cudart.cudaMemcpyAsync(
+                    device_ptr,
+                    host_array.ctypes.data,
+                    bytes_size,
+                    cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                    stream,
+                ),
+                f"cudaMemcpyAsync H2D {name}",
+            )
+            context.set_tensor_address(name, device_ptr)
+            input_allocations.append(device_ptr)
+
+        outputs_info: List[Tuple[str, np.ndarray, int]] = []
+        for name in output_names:
+            if self.engine.get_tensor_mode(name) != trt.TensorIOMode.OUTPUT:
+                raise KeyError(f"Tensor {name} is not registered as output")
+            shape = tuple(context.get_tensor_shape(name))
+            dtype = np.dtype(trt.nptype(self.engine.get_tensor_dtype(name)))
+            host_array = np.empty(shape, dtype=dtype)
+            status, device_ptr = cudart.cudaMalloc(host_array.nbytes)
+            _cuda_check(status, f"cudaMalloc output {name}")
+            context.set_tensor_address(name, device_ptr)
+            outputs_info.append((name, host_array, device_ptr))
+
+        success = context.execute_async_v3(stream_handle=stream)
+        if not success:
+            raise RuntimeError("TensorRT execution failed")
+
+        for name, host_array, device_ptr in outputs_info:
+            _cuda_check(
+                cudart.cudaMemcpyAsync(
+                    host_array.ctypes.data,
+                    device_ptr,
+                    host_array.nbytes,
+                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                    stream,
+                ),
+                f"cudaMemcpyAsync D2H {name}",
+            )
+        _cuda_check(cudart.cudaStreamSynchronize(stream), "cudaStreamSynchronize")
+
+        for device_ptr in input_allocations:
+            _cuda_check(cudart.cudaFree(device_ptr), "cudaFree input")
+        for _, _, device_ptr in outputs_info:
+            _cuda_check(cudart.cudaFree(device_ptr), "cudaFree output")
+
+        return [host_array for _, host_array, _ in outputs_info]
+
 
 def default_ppocrv5_profiles(
     *,
@@ -338,7 +588,8 @@ def default_ppocrv5_profiles(
 
     det_profile = {
         "x": ProfileShape(
-            min=(1, 3, 320, 320),
+            # 最小形状放宽到 32×32 以覆盖小图（DetResizeForTest 会输出 32 的倍数，如 256×416）
+            min=(1, 3, 32, 32),
             opt=(1, 3, min(det_max_side, 640), min(det_max_side, 640)),
             max=(1, 3, det_max_side, det_max_side),
         )

@@ -1,4 +1,5 @@
 import argparse
+import numpy as np
 import time
 from pathlib import Path
 
@@ -13,7 +14,7 @@ def parse_args() -> argparse.Namespace:
         "--image",
         type=Path,
         default=Path("onnxocr/test_images/images/999.jpg"),
-        help="测试图片路径",
+        help="图片路径或目录（目录时递归读取所有支持的图片）",
     )
     parser.add_argument(
         "--use-gpu",
@@ -69,7 +70,13 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="统计平均耗时的循环次数",
     )
-    parser.set_defaults(use_angle_cls=True, save_result=False)
+    parser.add_argument(
+        "--no-print-results",
+        dest="print_results",
+        action="store_false",
+        help="多图模式下不打印OCR文字结果（仅统计耗时）",
+    )
+    parser.set_defaults(use_angle_cls=True, save_result=False, print_results=True)
     return parser.parse_args()
 
 
@@ -77,7 +84,7 @@ def main() -> None:
     args = parse_args()
 
     if not args.image.exists():
-        raise FileNotFoundError(f"Image not found: {args.image}")
+        raise FileNotFoundError(f"Path not found: {args.image}")
 
     model_kwargs = {
         "use_angle_cls": args.use_angle_cls,
@@ -97,37 +104,83 @@ def main() -> None:
     print("Model options:", model_kwargs)
     model = ONNXPaddleOcr(**model_kwargs)
 
-    img = cv2.imread(str(args.image))
-    if img is None:
-        raise RuntimeError(f"Failed to read image: {args.image}")
+    # gather images
+    def _gather_images(root: Path) -> list[Path]:
+        if root.is_file():
+            return [root]
+        images: list[Path] = []
+        for pat in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp", "*.tif", "*.tiff"):
+            images.extend(root.rglob(pat))
+        images = sorted({p.resolve() for p in images})
+        return images
 
-    # warmup
+    images = _gather_images(args.image)
+    if not images:
+        raise RuntimeError(f"No images found under: {args.image}")
+
+    # warmup on first image
+    img0 = cv2.imread(str(images[0]))
+    if img0 is None:
+        raise RuntimeError(f"Failed to read image: {images[0]}")
     for _ in range(max(args.warmup, 0)):
-        model.ocr(img)
+        model.ocr(img0)
 
-    timings = []
-    repeat = max(args.repeat, 1)
-    for _ in range(repeat):
-        start = time.perf_counter()
-        result = model.ocr(img)
-        end = time.perf_counter()
-        timings.append(end - start)
+    # single image mode
+    if len(images) == 1:
+        timings = []
+        repeat = max(args.repeat, 1)
+        for _ in range(repeat):
+            start = time.perf_counter()
+            result = model.ocr(img0)
+            end = time.perf_counter()
+            timings.append(end - start)
 
-    avg = sum(timings) / len(timings)
-    print(f"Runs: {repeat}, avg: {avg:.4f}s, min: {min(timings):.4f}s, max: {max(timings):.4f}s")
+        avg = sum(timings) / len(timings)
+        print(f"Runs: {repeat}, avg: {avg:.4f}s, min: {min(timings):.4f}s, max: {max(timings):.4f}s")
 
-    if result is None or not result:
-        print("No result returned.")
+        if result is None or not result:
+            print("No result returned.")
+            return
+
+        if args.print_results:
+            print("OCR result:")
+            for box, rec in result[0]:
+                print(box, rec)
+
+        if args.save_result:
+            output_name = f"trt_test_{time.strftime('%Y%m%d_%H%M%S')}".replace(".", "_")
+            sav2Img(img0, result, name=f"{output_name}.jpg")
+            print("Saved visualization to", output_name + ".jpg")
         return
 
-    print("OCR result:")
-    for box, rec in result[0]:
-        print(box, rec)
+    # multi-image mode
+    all_timings: list[float] = []
+    total = len(images)
+    repeat = max(args.repeat, 1)
+    for idx, path in enumerate(images, 1):
+        img = cv2.imread(str(path))
+        if img is None:
+            print(f"[WARN] Failed to read image: {path}")
+            continue
+        for _ in range(repeat):
+            start = time.perf_counter()
+            _ = model.ocr(img)
+            end = time.perf_counter()
+            all_timings.append(end - start)
+        if idx % 10 == 0 or idx == total:
+            print(f"[Progress] {idx}/{total}")
 
-    if args.save_result:
-        output_name = f"trt_test_{time.strftime('%Y%m%d_%H%M%S')}".replace(".", "_")
-        sav2Img(img, result, name=f"{output_name}.jpg")
-        print("Saved visualization to", output_name + ".jpg")
+    if not all_timings:
+        print("No images processed.")
+        return
+    arr = np.array(all_timings, dtype=np.float64)
+    p50 = float(np.percentile(arr, 50))
+    p90 = float(np.percentile(arr, 90))
+    p99 = float(np.percentile(arr, 99))
+    print(
+        f"Images: {total}, Runs: {len(all_timings)}, "
+        f"avg: {arr.mean():.4f}s, p50: {p50:.4f}s, p90: {p90:.4f}s, p99: {p99:.4f}s"
+    )
 
 
 if __name__ == "__main__":
